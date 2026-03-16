@@ -2,10 +2,11 @@
 
 #import <objc/runtime.h>
 
+#import "DYYYABTestHook.h"
 #import "DYYYBackupPickerDelegate.h"
-#import "DYYYBottomAlertView.h"
 #import "DYYYDebugFloatButton.h"
 #import "DYYYDebugHelper.h"
+#import "DYYYDebugMenuViewController.h"
 #import "DYYYUtils.h"
 
 static NSString *const kDYYYEnableDebugModeKey = @"DYYYEnableDebugMode";
@@ -56,6 +57,7 @@ static CGFloat const kDYYYDebugButtonSize = 48.0;
     _debugModeEnabled = enabled;
     [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDYYYEnableDebugModeKey];
     if (!enabled) {
+        [DYYYABTestHook clearDebugABTestHitRecords];
         [self dismissCurrentMenuIfNeeded];
         [self.debugButton removeFromSuperview];
         self.debugButton = nil;
@@ -162,23 +164,87 @@ static CGFloat const kDYYYDebugButtonSize = 48.0;
     self.activeExportContext = context;
 
     __weak __typeof(self) weakSelf = self;
-    UIViewController *menuController = [DYYYBottomAlertView showAlertWithTitle:@"调试导出"
-                                                                       message:@"选择要导出的层级范围"
-                                                                     avatarURL:nil
-                                                              cancelButtonText:@"导出当前页"
-                                                             confirmButtonText:@"导出整窗"
-                                                                  cancelAction:^{
-                                                                    __strong __typeof(weakSelf) strongSelf = weakSelf;
-                                                                    [strongSelf exportCurrentPageFromContext:context];
-                                                                  }
-                                                                   closeAction:^{
-                                                                     __strong __typeof(weakSelf) strongSelf = weakSelf;
-                                                                     [strongSelf clearMenuContextIfNeeded:context];
-                                                                   }
-                                                                 confirmAction:^{
-                                                                   __strong __typeof(weakSelf) strongSelf = weakSelf;
-                                                                   [strongSelf exportWindowHierarchyFromContext:context];
-                                                                 }];
+    NSArray<DYYYDebugMenuAction *> *actions = @[
+        [DYYYDebugMenuAction actionWithTitle:@"导出当前页 UI"
+                                      detail:@"导出当前业务页的控制器树和 View 树"
+                                     handler:^{
+                                       __strong __typeof(weakSelf) strongSelf = weakSelf;
+                                       [strongSelf exportType:DYYYDebugExportTypeCurrentPageHierarchy
+                                                   fromContext:context
+                                                  loadingText:@"正在生成当前页 UI..."
+                                               failureMessage:@"导出当前页 UI 失败"];
+                                     }],
+        [DYYYDebugMenuAction actionWithTitle:@"导出整窗 UI"
+                                      detail:@"导出当前窗口的完整控制器树和 View 树"
+                                     handler:^{
+                                       __strong __typeof(weakSelf) strongSelf = weakSelf;
+                                       [strongSelf exportType:DYYYDebugExportTypeWindowHierarchy
+                                                   fromContext:context
+                                                  loadingText:@"正在生成整窗 UI..."
+                                               failureMessage:@"导出整窗 UI 失败"];
+                                     }],
+        [DYYYDebugMenuAction actionWithTitle:@"导出关键类方法"
+                                      detail:@"导出当前页关键控制器和模型类的方法列表与 type encoding"
+                                     handler:^{
+                                       __strong __typeof(weakSelf) strongSelf = weakSelf;
+                                       [strongSelf exportType:DYYYDebugExportTypeKeyClassMethods
+                                                   fromContext:context
+                                                  loadingText:@"正在生成关键类方法..."
+                                               failureMessage:@"导出关键类方法失败"];
+                                     }],
+        [DYYYDebugMenuAction actionWithTitle:@"导出关键对象链"
+                                      detail:@"导出当前页控制器链、可见同级控制器和关键模型对象链"
+                                     handler:^{
+                                       __strong __typeof(weakSelf) strongSelf = weakSelf;
+                                       [strongSelf exportType:DYYYDebugExportTypeObjectChain
+                                                   fromContext:context
+                                                  loadingText:@"正在生成关键对象链..."
+                                               failureMessage:@"导出关键对象链失败"];
+                                     }],
+        [DYYYDebugMenuAction actionWithTitle:@"导出模型字段值"
+                                      detail:@"导出当前模型一层字段，并展开常用链路对象"
+                                     handler:^{
+                                       __strong __typeof(weakSelf) strongSelf = weakSelf;
+                                       [strongSelf exportType:DYYYDebugExportTypeModelFieldValues
+                                                   fromContext:context
+                                                  loadingText:@"正在生成模型字段值..."
+                                               failureMessage:@"导出模型字段值失败"];
+                                     }],
+        [DYYYDebugMenuAction actionWithTitle:@"导出当前 ABTest 快照"
+                                      detail:@"导出当前 AWEABTestManager 中的完整 abTestData"
+                                     handler:^{
+                                       __strong __typeof(weakSelf) strongSelf = weakSelf;
+                                       [strongSelf exportType:DYYYDebugExportTypeABTestSnapshot
+                                                   fromContext:context
+                                                  loadingText:@"正在生成 ABTest 快照..."
+                                               failureMessage:@"导出当前 ABTest 快照失败"];
+                                     }],
+        [DYYYDebugMenuAction actionWithTitle:@"导出当前页 ABTest 命中"
+                                      detail:@"导出当前页运行时访问过的 ABTest key 及最近命中记录"
+                                     handler:^{
+                                       __strong __typeof(weakSelf) strongSelf = weakSelf;
+                                       [strongSelf exportType:DYYYDebugExportTypeABTestHitKeys
+                                                   fromContext:context
+                                                  loadingText:@"正在生成当前页 ABTest 命中..."
+                                               failureMessage:@"导出当前页 ABTest 命中失败"];
+                                     }],
+        [DYYYDebugMenuAction actionWithTitle:@"一键导出全部"
+                                      detail:@"导出当前页 UI、整窗 UI、增强调试文件和 Manifest 清单"
+                                     handler:^{
+                                       __strong __typeof(weakSelf) strongSelf = weakSelf;
+                                       [strongSelf exportAllDebugDataFromContext:context];
+                                     }],
+    ];
+
+    UIViewController *presentingViewController = [self bestPresentingControllerForContext:context];
+    UIViewController *menuController = [DYYYDebugMenuViewController showWithTitle:@"调试导出"
+                                                                          message:@"每个动作都会单独生成文件；一键导出会输出全部文件和清单"
+                                                                          actions:actions
+                                                         onPresentingViewController:presentingViewController
+                                                                      closeAction:^{
+                                                                        __strong __typeof(weakSelf) strongSelf = weakSelf;
+                                                                        [strongSelf clearMenuContextIfNeeded:context];
+                                                                      }];
     context.debugMenuController = menuController;
     self.debugMenuController = menuController;
 
@@ -208,21 +274,24 @@ static CGFloat const kDYYYDebugButtonSize = 48.0;
 
 #pragma mark - Export Flow
 
-- (void)exportCurrentPageFromContext:(DYYYDebugExportContext *)context {
-    [DYYYUtils showToast:@"正在生成调试文件..."];
+- (void)exportType:(DYYYDebugExportType)type
+       fromContext:(DYYYDebugExportContext *)context
+      loadingText:(NSString *)loadingText
+   failureMessage:(NSString *)failureMessage {
+    [DYYYUtils showToast:loadingText ?: @"正在生成调试文件..."];
     __weak __typeof(self) weakSelf = self;
-    [DYYYDebugHelper exportCurrentPageHierarchyFromContext:context completion:^(NSArray<NSURL *> *_Nullable exportFileURLs, NSArray<NSString *> *_Nullable tempFilePaths, NSError *_Nullable error) {
+    [DYYYDebugHelper exportDebugDataForType:type fromContext:context completion:^(NSArray<NSURL *> *_Nullable exportFileURLs, NSArray<NSString *> *_Nullable tempFilePaths, NSError *_Nullable error) {
       __strong __typeof(weakSelf) strongSelf = weakSelf;
-      [strongSelf handleExportResultWithFileURLs:exportFileURLs tempFilePaths:tempFilePaths error:error context:context failureMessage:@"导出当前页面失败"];
+      [strongSelf handleExportResultWithFileURLs:exportFileURLs tempFilePaths:tempFilePaths error:error context:context failureMessage:failureMessage];
     }];
 }
 
-- (void)exportWindowHierarchyFromContext:(DYYYDebugExportContext *)context {
-    [DYYYUtils showToast:@"正在生成调试文件..."];
+- (void)exportAllDebugDataFromContext:(DYYYDebugExportContext *)context {
+    [DYYYUtils showToast:@"正在生成全部调试文件..."];
     __weak __typeof(self) weakSelf = self;
-    [DYYYDebugHelper exportWindowHierarchyFromContext:context completion:^(NSArray<NSURL *> *_Nullable exportFileURLs, NSArray<NSString *> *_Nullable tempFilePaths, NSError *_Nullable error) {
+    [DYYYDebugHelper exportAllDebugDataFromContext:context completion:^(NSArray<NSURL *> *_Nullable exportFileURLs, NSArray<NSString *> *_Nullable tempFilePaths, NSError *_Nullable error) {
       __strong __typeof(weakSelf) strongSelf = weakSelf;
-      [strongSelf handleExportResultWithFileURLs:exportFileURLs tempFilePaths:tempFilePaths error:error context:context failureMessage:@"导出整窗层级失败"];
+      [strongSelf handleExportResultWithFileURLs:exportFileURLs tempFilePaths:tempFilePaths error:error context:context failureMessage:@"一键导出全部失败"];
     }];
 }
 

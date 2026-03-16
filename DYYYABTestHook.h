@@ -1,5 +1,7 @@
 #import <Foundation/Foundation.h>
 
+@class DYYYDebugExportContext;
+
 // 声明 DYYYABTestHook 类的接口
 @interface DYYYABTestHook : NSObject
 
@@ -35,5 +37,11 @@
  * @param notify 是否在完成后显示提示
  */
 + (void)checkForRemoteConfigUpdate:(BOOL)notify;
+
+/** 清空调试模式下的 ABTest 命中记录 */
++ (void)clearDebugABTestHitRecords;
+
+/** 导出当前页面关联的 ABTest 命中记录快照 */
++ (NSDictionary *)debugABTestHitSnapshotForCurrentPageContext:(DYYYDebugExportContext *)context;
 
 @end

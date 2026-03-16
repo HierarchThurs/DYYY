@@ -1,5 +1,6 @@
 #import "DYYYABTestHook.h"
 #import "DYYYConstants.h"
+#import "DYYYDebugHelper.h"
 #import "DYYYUtils.h"
 #import <objc/runtime.h>
 
@@ -12,11 +13,14 @@ static NSString *s_fileMode = nil;
 static NSString *const kDefaultRemoteConfigURL = DYYY_DEFAULT_ABTEST_URL;
 static NSString *const kDYYYTabBarHeightKey = @"DYYYTabBarHeight";
 static NSString *const kDYYYABTestTabBarHeightConfigKey = @"hp_tab_bar_custom_height_config";
+static NSString *const kDYYYDebugModeKey = @"DYYYEnableDebugMode";
+static NSUInteger const kDYYYABTestHitRecordLimit = 500;
 
 static dispatch_once_t s_loadOnceToken;
 static dispatch_queue_t s_abTestHookQueue;
 static dispatch_once_t s_queueOnceToken;
 static void *s_queueSpecificKey = &s_queueSpecificKey;
+static NSMutableDictionary<NSString *, NSMutableDictionary *> *s_debugABTestHitSessions = nil;
 
 static dispatch_queue_t DYYYABTestQueue() {
     dispatch_once(&s_queueOnceToken, ^{
@@ -29,6 +33,13 @@ static dispatch_queue_t DYYYABTestQueue() {
     return s_abTestHookQueue;
 }
 
+static NSMutableDictionary<NSString *, NSMutableDictionary *> *DYYYDebugABTestHitSessions(void) {
+    if (!s_debugABTestHitSessions) {
+        s_debugABTestHitSessions = [NSMutableDictionary dictionary];
+    }
+    return s_debugABTestHitSessions;
+}
+
 static void DYYYQueueSync(dispatch_block_t block) {
     dispatch_queue_t queue = DYYYABTestQueue();
     if (dispatch_get_specific(s_queueSpecificKey)) {
@@ -36,6 +47,147 @@ static void DYYYQueueSync(dispatch_block_t block) {
     } else {
         dispatch_sync(queue, block);
     }
+}
+
+static BOOL DYYYIsDebugModeEnabled(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kDYYYDebugModeKey];
+}
+
+static BOOL DYYYIsDebugOwnedController(UIViewController *controller) {
+    if (!controller) {
+        return NO;
+    }
+
+    NSString *className = NSStringFromClass(controller.class) ?: @"";
+    return [className hasPrefix:@"DYYY"];
+}
+
+static UIViewController *DYYYResolveVisibleViewController(UIViewController *controller) {
+    if (!controller) {
+        return nil;
+    }
+
+    UIViewController *presentedViewController = controller.presentedViewController;
+    if (presentedViewController && !presentedViewController.isBeingDismissed) {
+        return DYYYResolveVisibleViewController(presentedViewController);
+    }
+
+    if ([controller isKindOfClass:[UINavigationController class]]) {
+        UINavigationController *navigationController = (UINavigationController *)controller;
+        UIViewController *visibleViewController = navigationController.visibleViewController ?: navigationController.topViewController ?: navigationController.viewControllers.lastObject;
+        return DYYYResolveVisibleViewController(visibleViewController);
+    }
+
+    if ([controller isKindOfClass:[UITabBarController class]]) {
+        UITabBarController *tabBarController = (UITabBarController *)controller;
+        UIViewController *selectedViewController = tabBarController.selectedViewController ?: tabBarController.moreNavigationController.topViewController;
+        return DYYYResolveVisibleViewController(selectedViewController);
+    }
+
+    for (UIViewController *childViewController in [controller.childViewControllers reverseObjectEnumerator]) {
+        if (!childViewController.isViewLoaded) {
+            continue;
+        }
+
+        UIView *childView = childViewController.view;
+        if (!childView.window || childView.hidden || childView.alpha <= 0.01) {
+            continue;
+        }
+
+        UIViewController *resolvedChild = DYYYResolveVisibleViewController(childViewController);
+        if (resolvedChild) {
+            return resolvedChild;
+        }
+    }
+
+    return controller;
+}
+
+static UIViewController *DYYYResolveCurrentBusinessController(void) {
+    UIWindow *activeWindow = [DYYYUtils getActiveWindow];
+    UIViewController *visibleViewController = DYYYResolveVisibleViewController(activeWindow.rootViewController);
+    if (!DYYYIsDebugOwnedController(visibleViewController)) {
+        return visibleViewController;
+    }
+
+    UIViewController *presentingViewController = visibleViewController.presentingViewController;
+    while (presentingViewController) {
+        UIViewController *resolvedController = DYYYResolveVisibleViewController(presentingViewController);
+        if (!DYYYIsDebugOwnedController(resolvedController)) {
+            return resolvedController;
+        }
+        presentingViewController = presentingViewController.presentingViewController;
+    }
+
+    return visibleViewController;
+}
+
+static NSString *DYYYABTestHitPageSessionKey(NSString *pageClassName, NSString *pageAddress) {
+    return [NSString stringWithFormat:@"%@#%@", pageClassName ?: @"Unknown", pageAddress ?: @"0x0"];
+}
+
+static void DYYYRecordABTestHit(NSString *managerMethod, NSString *key) {
+    if (!DYYYIsDebugModeEnabled() || key.length == 0) {
+        return;
+    }
+
+    UIViewController *pageController = DYYYResolveCurrentBusinessController();
+    NSString *pageClassName = NSStringFromClass(pageController.class) ?: @"Unknown";
+    NSString *pageAddress = pageController ? [NSString stringWithFormat:@"%p", pageController] : @"0x0";
+    NSTimeInterval timestamp = [[NSDate date] timeIntervalSince1970];
+
+    dispatch_async(DYYYABTestQueue(), ^{
+      NSMutableDictionary *sessions = DYYYDebugABTestHitSessions();
+      NSString *sessionKey = DYYYABTestHitPageSessionKey(pageClassName, pageAddress);
+      NSMutableDictionary *session = sessions[sessionKey];
+      if (!session) {
+          session = [@{
+              @"pageClassName" : pageClassName,
+              @"pageAddress" : pageAddress,
+              @"firstHitTimestamp" : @(timestamp),
+              @"lastHitTimestamp" : @(timestamp),
+              @"uniqueKeys" : [NSMutableOrderedSet orderedSet],
+              @"records" : [NSMutableArray array]
+          } mutableCopy];
+          sessions[sessionKey] = session;
+      }
+
+      session[@"lastHitTimestamp"] = @(timestamp);
+      [(NSMutableOrderedSet *)session[@"uniqueKeys"] addObject:key];
+
+      NSMutableArray *records = session[@"records"];
+      [records addObject:@{
+          @"timestamp" : @(timestamp),
+          @"pageClassName" : pageClassName,
+          @"pageAddress" : pageAddress,
+          @"managerMethod" : managerMethod ?: @"",
+          @"key" : key
+      }];
+      if (records.count > kDYYYABTestHitRecordLimit) {
+          [records removeObjectsInRange:NSMakeRange(0, records.count - kDYYYABTestHitRecordLimit)];
+      }
+    });
+}
+
+static NSDictionary *DYYYABTestHitSnapshotForPageInfo(NSString *pageClassName, NSString *pageAddress) {
+    __block NSDictionary *snapshot = nil;
+    DYYYQueueSync(^{
+      NSMutableDictionary *sessions = DYYYDebugABTestHitSessions();
+      NSDictionary *session = sessions[DYYYABTestHitPageSessionKey(pageClassName, pageAddress)];
+      NSArray *uniqueKeys = session ? [[(NSOrderedSet *)session[@"uniqueKeys"] array] copy] : @[];
+      NSArray *records = session ? [session[@"records"] copy] : @[];
+      snapshot = @{
+          @"pageClassName" : pageClassName ?: @"Unknown",
+          @"pageAddress" : pageAddress ?: @"0x0",
+          @"uniqueKeyCount" : @(uniqueKeys.count),
+          @"uniqueKeys" : uniqueKeys ?: @[],
+          @"recordCount" : @(records.count),
+          @"records" : records ?: @[],
+          @"firstHitTimestamp" : session[@"firstHitTimestamp"] ?: [NSNull null],
+          @"lastHitTimestamp" : session[@"lastHitTimestamp"] ?: [NSNull null]
+      };
+    });
+    return snapshot;
 }
 
 static NSNumber *DYYYResolveTabBarHeightFromSettings(void) {
@@ -402,6 +554,19 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
     });
 }
 
++ (void)clearDebugABTestHitRecords {
+    dispatch_async(DYYYABTestQueue(), ^{
+      [DYYYDebugABTestHitSessions() removeAllObjects];
+    });
+}
+
++ (NSDictionary *)debugABTestHitSnapshotForCurrentPageContext:(DYYYDebugExportContext *)context {
+    UIViewController *pageController = context.sourceBusinessViewController ?: DYYYResolveCurrentBusinessController();
+    NSString *pageClassName = NSStringFromClass(pageController.class) ?: @"Unknown";
+    NSString *pageAddress = pageController ? [NSString stringWithFormat:@"%p", pageController] : @"0x0";
+    return DYYYABTestHitSnapshotForPageInfo(pageClassName, pageAddress);
+}
+
 @end
 
 %hook AWEABTestManager
@@ -530,6 +695,18 @@ static void DYYYApplyTabBarHeightToCurrentABTestDataIfNeeded(void) {
         return;
     }
     %orig;
+}
+
+- (id)getValueOfConsistentABTestWithKey:(id)key {
+    id result = %orig;
+    NSString *keyString = nil;
+    if ([key isKindOfClass:[NSString class]]) {
+        keyString = (NSString *)key;
+    } else if ([key respondsToSelector:@selector(description)]) {
+        keyString = [key description];
+    }
+    DYYYRecordABTestHit(@"getValueOfConsistentABTestWithKey:", keyString);
+    return result;
 }
 
 %end

@@ -3208,7 +3208,7 @@ speedSettingsItem.detail = trimmedText;
     AWESettingItemModel *debugModeItem = [DYYYSettingsHelper createSettingItem:@{
         @"identifier" : @"DYYYEnableDebugMode",
         @"title" : @"开启调试模式",
-        @"subTitle" : @"开启后会在抖音顶层显示调试按钮，可导出当前页和整窗层级",
+        @"subTitle" : @"开启后会在抖音顶层显示调试按钮，可分别导出 UI、方法、对象链、模型字段、ABTest，并支持一键全量导出",
         @"detail" : @"",
         @"cellType" : @37,
         @"imageName" : @"ic_gearsimplify_outlined_20"
