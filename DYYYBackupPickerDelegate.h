@@ -3,4 +3,5 @@
 @interface DYYYBackupPickerDelegate : NSObject <UIDocumentPickerDelegate>
 @property(nonatomic, copy) void (^completionBlock)(NSURL *url);
 @property(nonatomic, copy) NSString *tempFilePath;
+@property(nonatomic, copy) NSArray<NSString *> *tempFilePaths;
 @end

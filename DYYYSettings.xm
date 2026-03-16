@@ -14,6 +14,7 @@
 #import "DYYYOptionsSelectionView.h"
 
 #import "DYYYConstants.h"
+#import "DYYYDebugOverlayManager.h"
 #import "DYYYSettingsHelper.h"
 #import "DYYYUtils.h"
 
@@ -3203,6 +3204,28 @@ speedSettingsItem.detail = trimmedText;
       [rootVC.navigationController pushViewController:(UIViewController *)subVC animated:YES];
     };
     [mainItems addObject:floatButtonSettingItem];
+
+    AWESettingItemModel *debugModeItem = [DYYYSettingsHelper createSettingItem:@{
+        @"identifier" : @"DYYYEnableDebugMode",
+        @"title" : @"开启调试模式",
+        @"subTitle" : @"开启后会在抖音顶层显示调试按钮，可导出当前页和整窗层级",
+        @"detail" : @"",
+        @"cellType" : @37,
+        @"imageName" : @"ic_gearsimplify_outlined_20"
+    }];
+    __weak AWESettingItemModel *weakDebugModeItem = debugModeItem;
+    debugModeItem.switchChangedBlock = ^{
+      __strong AWESettingItemModel *strongDebugModeItem = weakDebugModeItem;
+      if (!strongDebugModeItem || !strongDebugModeItem.isEnable) {
+          return;
+      }
+
+      BOOL isSwitchOn = !strongDebugModeItem.isSwitchOn;
+      strongDebugModeItem.isSwitchOn = isSwitchOn;
+      [DYYYSettingsHelper setUserDefaults:@(isSwitchOn) forKey:strongDebugModeItem.identifier];
+      [[DYYYDebugOverlayManager sharedManager] setDebugModeEnabled:isSwitchOn];
+    };
+    [mainItems addObject:debugModeItem];
 
     // 创建备份设置分类
     AWESettingSectionModel *backupSection = [[%c(AWESettingSectionModel) alloc] init];

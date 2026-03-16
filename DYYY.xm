@@ -19,6 +19,7 @@
 
 #import "AWMSafeDispatchTimer.h"
 #import "DYYYConstants.h"
+#import "DYYYDebugOverlayManager.h"
 #import "DYYYFloatClearButton.h"
 #import "DYYYFloatSpeedButton.h"
 #import "DYYYSettingViewController.h"
@@ -7828,6 +7829,7 @@ static void DYYYRemoveKeyboardObserver(void) {
     initTargetClassNames();
 
     updateGlobalTransparencyCache();
+    [[DYYYDebugOverlayManager sharedManager] setDebugModeEnabled:[[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYEnableDebugMode"]];
 
     [[NSUserDefaults standardUserDefaults] addObserver:(NSObject *)self forKeyPath:kDYYYGlobalTransparencyKey options:NSKeyValueObservingOptionNew context:DYYYGlobalTransparencyContext];
 
