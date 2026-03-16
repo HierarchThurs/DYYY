@@ -10,11 +10,19 @@
 #import "DYYYUtils.h"
 
 static NSString *const kDYYYEnableDebugModeKey = @"DYYYEnableDebugMode";
+static NSString *const kDYYYDebugOverlayLaunchGuardPendingKey = @"DYYYDebugOverlayLaunchGuardPending";
+static NSString *const kDYYYDebugOverlayRecoveryNoticePendingKey = @"DYYYDebugOverlayRecoveryNoticePending";
+static NSString *const kDYYYDebugOverlayStartupLogFilename = @"debug_overlay_startup.log";
 static CGFloat const kDYYYDebugButtonSize = 48.0;
+static NSTimeInterval const kDYYYDebugButtonAttachDelay = 0.35;
+static NSTimeInterval const kDYYYDebugButtonStartupValidationDelay = 0.15;
+static NSUInteger const kDYYYDebugOverlayStartupLogMaxLines = 200;
 
 @interface DYYYDebugOverlayManager ()
 
 @property(nonatomic, assign) BOOL debugModeEnabled;
+@property(nonatomic, assign) BOOL pendingStartupAttachment;
+@property(nonatomic, assign) NSUInteger attachmentGeneration;
 @property(nonatomic, strong) DYYYDebugFloatButton *debugButton;
 @property(nonatomic, strong, nullable) UIViewController *debugMenuController;
 @property(nonatomic, strong, nullable) DYYYDebugExportContext *activeExportContext;
@@ -42,8 +50,46 @@ static CGFloat const kDYYYDebugButtonSize = 48.0;
     }
 
     [self registerObservers];
-    _debugModeEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:kDYYYEnableDebugModeKey];
+    _debugModeEnabled = NO;
+    _pendingStartupAttachment = NO;
+    _attachmentGeneration = 0;
     return self;
+}
+
+- (void)bootstrapFromStoredSettings {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [self bootstrapFromStoredSettings];
+        });
+        return;
+    }
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL shouldEnableDebugMode = [defaults boolForKey:kDYYYEnableDebugModeKey];
+    BOOL hasPendingLaunchGuard = [defaults boolForKey:kDYYYDebugOverlayLaunchGuardPendingKey];
+    [self recordStartupLog:[NSString stringWithFormat:@"bootstrap: debug=%@ launchGuard=%@",
+                                                      shouldEnableDebugMode ? @"YES" : @"NO",
+                                                      hasPendingLaunchGuard ? @"YES" : @"NO"]];
+
+    if (!shouldEnableDebugMode) {
+        self.debugModeEnabled = NO;
+        self.pendingStartupAttachment = NO;
+        [self clearStartupLaunchGuardIfNeededWithReason:@"bootstrap_debug_disabled"];
+        [self teardownDebugOverlay];
+        [self handlePendingRecoveryNoticeIfNeeded];
+        return;
+    }
+
+    if (hasPendingLaunchGuard) {
+        [self autoRecoverFromPendingStartupGuard];
+        [self handlePendingRecoveryNoticeIfNeeded];
+        return;
+    }
+
+    self.debugModeEnabled = YES;
+    self.pendingStartupAttachment = YES;
+    [self scheduleDebugButtonAttachmentWithReason:@"bootstrap"];
+    [self handlePendingRecoveryNoticeIfNeeded];
 }
 
 - (void)setDebugModeEnabled:(BOOL)enabled {
@@ -55,15 +101,21 @@ static CGFloat const kDYYYDebugButtonSize = 48.0;
     }
 
     _debugModeEnabled = enabled;
-    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDYYYEnableDebugModeKey];
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setBool:enabled forKey:kDYYYEnableDebugModeKey];
+    [defaults synchronize];
     if (!enabled) {
+        [self recordStartupLog:@"setDebugModeEnabled:NO"];
+        self.pendingStartupAttachment = NO;
+        self.attachmentGeneration += 1;
+        [self clearStartupLaunchGuardIfNeededWithReason:@"manual_disable"];
         [DYYYABTestHook clearDebugABTestHitRecords];
-        [self dismissCurrentMenuIfNeeded];
-        [self.debugButton removeFromSuperview];
-        self.debugButton = nil;
+        [self teardownDebugOverlay];
         return;
     }
 
+    [self recordStartupLog:@"setDebugModeEnabled:YES"];
+    self.pendingStartupAttachment = NO;
     [self refreshDebugButtonAttachment];
 }
 
@@ -79,19 +131,288 @@ static CGFloat const kDYYYDebugButtonSize = 48.0;
         return;
     }
 
-    UIWindow *activeWindow = [DYYYUtils getActiveWindow];
-    if (!activeWindow) {
+    [self scheduleDebugButtonAttachmentWithReason:@"refresh"];
+}
+
+- (void)scheduleDebugButtonAttachmentWithReason:(NSString *)reason {
+    if (!self.debugModeEnabled) {
         return;
     }
 
-    [self createDebugButtonIfNeeded];
-    if (self.debugButton.superview != activeWindow) {
-        [self.debugButton removeFromSuperview];
-        [activeWindow addSubview:self.debugButton];
+    self.attachmentGeneration += 1;
+    NSUInteger generation = self.attachmentGeneration;
+    [self recordStartupLog:[NSString stringWithFormat:@"schedule attach: reason=%@ pendingStartup=%@",
+                                                      reason ?: @"unknown",
+                                                      self.pendingStartupAttachment ? @"YES" : @"NO"]];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDYYYDebugButtonAttachDelay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                     if (!self.debugModeEnabled || generation != self.attachmentGeneration) {
+                         return;
+                     }
+                     [self attemptDebugButtonAttachmentWithReason:reason];
+                   });
+}
+
+- (void)attemptDebugButtonAttachmentWithReason:(NSString *)reason {
+    UIWindow *activeWindow = [DYYYUtils getActiveWindow];
+    NSString *failureReason = nil;
+    if (![self canSafelyAttachToWindow:activeWindow failureReason:&failureReason]) {
+        [self recordStartupLog:[NSString stringWithFormat:@"attach skipped: reason=%@ failure=%@ window=%@",
+                                                          reason ?: @"unknown",
+                                                          failureReason ?: @"unknown",
+                                                          [self windowSummary:activeWindow]]];
+        return;
     }
 
-    [self.debugButton.superview bringSubviewToFront:self.debugButton];
-    [self.debugButton loadSavedPosition];
+    BOOL shouldTrackLaunchGuard = self.pendingStartupAttachment;
+    if (shouldTrackLaunchGuard) {
+        [self armStartupLaunchGuardIfNeededWithReason:reason];
+    }
+
+    @try {
+        [self createDebugButtonIfNeeded];
+        if (self.debugButton.superview != activeWindow) {
+            [self.debugButton removeFromSuperview];
+            [activeWindow addSubview:self.debugButton];
+        }
+
+        [self.debugButton.superview bringSubviewToFront:self.debugButton];
+        [self.debugButton loadSavedPosition];
+        [self recordStartupLog:[NSString stringWithFormat:@"attach success: reason=%@ window=%@ root=%@",
+                                                          reason ?: @"unknown",
+                                                          [self windowSummary:activeWindow],
+                                                          [self viewControllerSummary:activeWindow.rootViewController]]];
+    } @catch (NSException *exception) {
+        [self handleAttachmentException:exception reason:reason];
+        return;
+    }
+
+    if (!shouldTrackLaunchGuard) {
+        return;
+    }
+
+    self.pendingStartupAttachment = NO;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDYYYDebugButtonStartupValidationDelay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                     if (!self.debugModeEnabled) {
+                         return;
+                     }
+                     if (self.debugButton.superview && self.debugButton.window) {
+                         [self clearStartupLaunchGuardIfNeededWithReason:@"attach_validated"];
+                     } else {
+                         [self recordStartupLog:@"attach validation failed: button detached before validation"];
+                     }
+                   });
+}
+
+- (BOOL)canSafelyAttachToWindow:(UIWindow *)window failureReason:(NSString **)failureReason {
+    UIApplication *application = [UIApplication sharedApplication];
+    if (application.applicationState != UIApplicationStateActive) {
+        if (failureReason) {
+            *failureReason = @"app_not_active";
+        }
+        return NO;
+    }
+
+    if (!window) {
+        if (failureReason) {
+            *failureReason = @"missing_window";
+        }
+        return NO;
+    }
+
+    if (window.isHidden) {
+        if (failureReason) {
+            *failureReason = @"window_hidden";
+        }
+        return NO;
+    }
+
+    if (!window.rootViewController) {
+        if (failureReason) {
+            *failureReason = @"missing_root_view_controller";
+        }
+        return NO;
+    }
+
+    CGRect bounds = window.bounds;
+    if (CGRectGetWidth(bounds) <= 1.0 || CGRectGetHeight(bounds) <= 1.0) {
+        if (failureReason) {
+            *failureReason = @"invalid_window_bounds";
+        }
+        return NO;
+    }
+
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *windowScene = window.windowScene;
+        if (!windowScene) {
+            if (failureReason) {
+                *failureReason = @"missing_window_scene";
+            }
+            return NO;
+        }
+        if (windowScene.activationState != UISceneActivationStateForegroundActive) {
+            if (failureReason) {
+                *failureReason = @"window_scene_not_active";
+            }
+            return NO;
+        }
+    }
+
+    return YES;
+}
+
+- (void)armStartupLaunchGuardIfNeededWithReason:(NSString *)reason {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if ([defaults boolForKey:kDYYYDebugOverlayLaunchGuardPendingKey]) {
+        return;
+    }
+
+    [defaults setBool:YES forKey:kDYYYDebugOverlayLaunchGuardPendingKey];
+    [defaults synchronize];
+    [self recordStartupLog:[NSString stringWithFormat:@"launch guard armed: reason=%@", reason ?: @"unknown"]];
+}
+
+- (void)clearStartupLaunchGuardIfNeededWithReason:(NSString *)reason {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (![defaults boolForKey:kDYYYDebugOverlayLaunchGuardPendingKey]) {
+        return;
+    }
+
+    [defaults setBool:NO forKey:kDYYYDebugOverlayLaunchGuardPendingKey];
+    [defaults synchronize];
+    [self recordStartupLog:[NSString stringWithFormat:@"launch guard cleared: reason=%@", reason ?: @"unknown"]];
+}
+
+- (void)persistDisabledDebugModeWithRecoveryNotice:(BOOL)shouldSetRecoveryNotice
+                            clearStartupLaunchGuard:(BOOL)shouldClearLaunchGuard
+                                             reason:(NSString *)reason {
+    _debugModeEnabled = NO;
+    self.pendingStartupAttachment = NO;
+    self.attachmentGeneration += 1;
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setBool:NO forKey:kDYYYEnableDebugModeKey];
+    if (shouldClearLaunchGuard) {
+        [defaults setBool:NO forKey:kDYYYDebugOverlayLaunchGuardPendingKey];
+    }
+    if (shouldSetRecoveryNotice) {
+        [defaults setBool:YES forKey:kDYYYDebugOverlayRecoveryNoticePendingKey];
+    }
+    [defaults synchronize];
+
+    [self recordStartupLog:[NSString stringWithFormat:@"persist debug disabled: reason=%@ recoveryNotice=%@ clearLaunchGuard=%@",
+                                                      reason ?: @"unknown",
+                                                      shouldSetRecoveryNotice ? @"YES" : @"NO",
+                                                      shouldClearLaunchGuard ? @"YES" : @"NO"]];
+    [DYYYABTestHook clearDebugABTestHitRecords];
+    [self teardownDebugOverlay];
+}
+
+- (void)autoRecoverFromPendingStartupGuard {
+    [self recordStartupLog:@"auto recovery triggered from pending launch guard"];
+    [self persistDisabledDebugModeWithRecoveryNotice:YES
+                              clearStartupLaunchGuard:YES
+                                               reason:@"startup_guard_recovery"];
+}
+
+- (void)handlePendingRecoveryNoticeIfNeeded {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [self handlePendingRecoveryNoticeIfNeeded];
+        });
+        return;
+    }
+
+    UIApplication *application = [UIApplication sharedApplication];
+    if (application.applicationState != UIApplicationStateActive) {
+        return;
+    }
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (![defaults boolForKey:kDYYYDebugOverlayRecoveryNoticePendingKey]) {
+        return;
+    }
+
+    [defaults setBool:NO forKey:kDYYYDebugOverlayRecoveryNoticePendingKey];
+    [defaults synchronize];
+    [self recordStartupLog:@"show recovery notice"];
+    [DYYYUtils showToast:@"检测到调试模式启动异常，已自动关闭"];
+}
+
+- (void)handleAttachmentException:(NSException *)exception reason:(NSString *)reason {
+    NSString *exceptionMessage = [NSString stringWithFormat:@"attach exception: reason=%@ name=%@ message=%@",
+                                                            reason ?: @"unknown",
+                                                            exception.name ?: @"",
+                                                            exception.reason ?: @""];
+    [self recordStartupLog:exceptionMessage];
+
+    BOOL shouldSetRecoveryNotice = self.pendingStartupAttachment || [[NSUserDefaults standardUserDefaults] boolForKey:kDYYYDebugOverlayLaunchGuardPendingKey];
+    [self persistDisabledDebugModeWithRecoveryNotice:shouldSetRecoveryNotice
+                              clearStartupLaunchGuard:YES
+                                               reason:[NSString stringWithFormat:@"attach_exception_%@", reason ?: @"unknown"]];
+    [DYYYUtils showToast:@"调试模式初始化失败，已自动关闭"];
+}
+
+- (void)teardownDebugOverlay {
+    [self dismissCurrentMenuIfNeeded];
+    [self.debugButton removeFromSuperview];
+    self.debugButton = nil;
+}
+
+- (void)recordStartupLog:(NSString *)message {
+    if (message.length == 0) {
+        return;
+    }
+
+    @synchronized(self) {
+        NSString *logPath = [DYYYUtils cachePathForFilename:kDYYYDebugOverlayStartupLogFilename];
+        NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+        formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+        NSString *timestamp = [formatter stringFromDate:[NSDate date]];
+        NSString *line = [NSString stringWithFormat:@"[%@] %@", timestamp, message];
+
+        NSError *readError = nil;
+        NSString *existingContent = [NSString stringWithContentsOfFile:logPath encoding:NSUTF8StringEncoding error:&readError];
+        NSMutableArray<NSString *> *lines = [NSMutableArray array];
+        if (existingContent.length > 0) {
+            for (NSString *existingLine in [existingContent componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+                if (existingLine.length > 0) {
+                    [lines addObject:existingLine];
+                }
+            }
+        }
+
+        [lines addObject:line];
+        if (lines.count > kDYYYDebugOverlayStartupLogMaxLines) {
+            NSRange trimRange = NSMakeRange(lines.count - kDYYYDebugOverlayStartupLogMaxLines, kDYYYDebugOverlayStartupLogMaxLines);
+            lines = [[lines subarrayWithRange:trimRange] mutableCopy];
+        }
+
+        NSString *finalContent = [[lines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
+        [finalContent writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
+
+- (NSString *)windowSummary:(UIWindow *)window {
+    if (!window) {
+        return @"(null)";
+    }
+    return [NSString stringWithFormat:@"%@<%p> hidden=%@ bounds=%@",
+                                      NSStringFromClass(window.class) ?: @"UIWindow",
+                                      window,
+                                      window.isHidden ? @"YES" : @"NO",
+                                      NSStringFromCGRect(window.bounds)];
+}
+
+- (NSString *)viewControllerSummary:(UIViewController *)viewController {
+    if (!viewController) {
+        return @"(null)";
+    }
+    return [NSString stringWithFormat:@"%@<%p> loaded=%@",
+                                      NSStringFromClass(viewController.class) ?: @"UIViewController",
+                                      viewController,
+                                      viewController.isViewLoaded ? @"YES" : @"NO"];
 }
 
 #pragma mark - Observers
@@ -108,7 +429,7 @@ static CGFloat const kDYYYDebugButtonSize = 48.0;
                                             if (!strongSelf || !strongSelf.debugModeEnabled) {
                                                 return;
                                             }
-                                            [strongSelf refreshDebugButtonAttachment];
+                                            [strongSelf scheduleDebugButtonAttachmentWithReason:@"window_did_become_key"];
                                           }];
 
     self.didBecomeActiveObserver = [center addObserverForName:UIApplicationDidBecomeActiveNotification
@@ -116,10 +437,13 @@ static CGFloat const kDYYYDebugButtonSize = 48.0;
                                                         queue:[NSOperationQueue mainQueue]
                                                    usingBlock:^(NSNotification *_Nonnull notification) {
                                                      __strong __typeof(weakSelf) strongSelf = weakSelf;
-                                                     if (!strongSelf || !strongSelf.debugModeEnabled) {
+                                                     if (!strongSelf) {
                                                          return;
                                                      }
-                                                     [strongSelf refreshDebugButtonAttachment];
+                                                     [strongSelf handlePendingRecoveryNoticeIfNeeded];
+                                                     if (strongSelf.debugModeEnabled) {
+                                                         [strongSelf scheduleDebugButtonAttachmentWithReason:@"app_did_become_active"];
+                                                     }
                                                    }];
 
     self.willEnterForegroundObserver = [center addObserverForName:UIApplicationWillEnterForegroundNotification
@@ -127,10 +451,13 @@ static CGFloat const kDYYYDebugButtonSize = 48.0;
                                                             queue:[NSOperationQueue mainQueue]
                                                        usingBlock:^(NSNotification *_Nonnull notification) {
                                                          __strong __typeof(weakSelf) strongSelf = weakSelf;
-                                                         if (!strongSelf || !strongSelf.debugModeEnabled) {
+                                                         if (!strongSelf) {
                                                              return;
                                                          }
-                                                         [strongSelf refreshDebugButtonAttachment];
+                                                         [strongSelf handlePendingRecoveryNoticeIfNeeded];
+                                                         if (strongSelf.debugModeEnabled) {
+                                                             [strongSelf scheduleDebugButtonAttachmentWithReason:@"app_will_enter_foreground"];
+                                                         }
                                                        }];
 }
 

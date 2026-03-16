@@ -43,6 +43,7 @@ static NSString *const kDYYYDebugManifestLabel = @"Manifest";
 + (BOOL)shouldSkipController:(UIViewController *)controller context:(DYYYDebugExportContext *)context;
 + (BOOL)shouldSkipView:(UIView *)view context:(DYYYDebugExportContext *)context;
 + (BOOL)isDebugOwnedController:(UIViewController *)viewController;
++ (BOOL)isNoiseView:(UIView *)view;
 + (NSString *)textRepresentationForHierarchySnapshot:(NSDictionary *)snapshot;
 + (void)appendControllerNode:(NSDictionary *)node toString:(NSMutableString *)text indent:(NSUInteger)indent relationship:(NSString *_Nullable)relationship;
 + (void)appendViewNode:(NSDictionary *)node toString:(NSMutableString *)text indent:(NSUInteger)indent;
@@ -67,6 +68,16 @@ static NSString *const kDYYYDebugManifestLabel = @"Manifest";
 + (NSArray<NSDictionary *> *)propertyEntriesForClass:(Class)targetClass object:(id)object;
 + (NSArray<NSDictionary *> *)ivarEntriesForClass:(Class)targetClass object:(id)object;
 + (id)serializableValueSummary:(id)value;
++ (id)serializableValueSummary:(id)value fieldName:(NSString *_Nullable)fieldName wasRedacted:(BOOL *_Nullable)wasRedacted;
++ (NSDictionary *)rawFieldEntryWithName:(NSString *)name attributes:(NSString *_Nullable)attributes typeEncoding:(NSString *_Nullable)typeEncoding value:(id)value;
++ (NSArray<NSDictionary *> *)deduplicatedFieldEntries:(NSArray<NSDictionary *> *)entries;
++ (NSDictionary *)finalizedFieldEntryFromRawEntry:(NSDictionary *)rawEntry;
++ (BOOL)isMeaningfulExportValue:(id)value;
++ (BOOL)isSensitiveFieldName:(NSString *)fieldName;
++ (NSString *)sanitizedStringValue:(NSString *)string fieldName:(NSString *_Nullable)fieldName didRedact:(BOOL *_Nullable)didRedact;
++ (NSString *)redactedString:(NSString *)string;
++ (NSString *)redactedURLStringIfNeeded:(NSString *)string didRedact:(BOOL *_Nullable)didRedact;
++ (BOOL)shouldRedactURLQueryItem:(NSString *)itemName;
 + (NSString *)textRepresentationForModelFieldSnapshot:(NSDictionary *)snapshot;
 + (void)appendObjectDump:(NSDictionary *)objectDump toString:(NSMutableString *)text;
 
@@ -423,6 +434,7 @@ static NSString *const kDYYYDebugManifestLabel = @"Manifest";
         return @"";
     }
     NSString *description = [object description] ?: @"";
+    description = [self sanitizedStringValue:description fieldName:nil didRedact:nil];
     return [self truncatedString:description maxLength:200];
 }
 
@@ -532,6 +544,10 @@ static NSString *const kDYYYDebugManifestLabel = @"Manifest";
         return YES;
     }
 
+    if ([self isNoiseView:view]) {
+        return YES;
+    }
+
     if (context.debugButtonView && [view isDescendantOfView:context.debugButtonView]) {
         return YES;
     }
@@ -542,6 +558,18 @@ static NSString *const kDYYYDebugManifestLabel = @"Manifest";
     }
 
     return NO;
+}
+
++ (BOOL)isNoiseView:(UIView *)view {
+    if (!view) {
+        return NO;
+    }
+
+    NSString *className = NSStringFromClass(view.class) ?: @"";
+    return [className isEqualToString:@"DUXToast"] ||
+           [className hasPrefix:@"DUXToast"] ||
+           [className isEqualToString:@"DYYYToast"] ||
+           [className hasPrefix:@"DYYYToast"];
 }
 
 + (BOOL)isDebugOwnedController:(UIViewController *)viewController {
@@ -1042,20 +1070,12 @@ static NSString *const kDYYYDebugManifestLabel = @"Manifest";
         NSString *name = property_getName(property) ? @(property_getName(property)) : @"";
         NSString *attributes = property_getAttributes(property) ? @(property_getAttributes(property)) : @"";
         id value = [self safeValueForKey:name onObject:object];
-        [properties addObject:@{
-            @"name" : name,
-            @"attributes" : attributes,
-            @"value" : [self serializableValueSummary:value] ?: [NSNull null]
-        }];
+        [properties addObject:[self rawFieldEntryWithName:name attributes:attributes typeEncoding:nil value:value]];
     }
     if (propertyList) {
         free(propertyList);
     }
-
-    [properties sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
-      return [left[@"name"] localizedCaseInsensitiveCompare:right[@"name"]];
-    }];
-    return [properties copy];
+    return [self deduplicatedFieldEntries:properties];
 }
 
 + (NSArray<NSDictionary *> *)ivarEntriesForClass:(Class)targetClass object:(id)object {
@@ -1071,37 +1091,38 @@ static NSString *const kDYYYDebugManifestLabel = @"Manifest";
         if ([typeEncoding hasPrefix:@"@"]) {
             @try {
                 id value = object_getIvar(object, ivar);
-                valueSummary = [self serializableValueSummary:value] ?: [NSNull null];
+                valueSummary = value ?: [NSNull null];
             } @catch (__unused NSException *exception) {
                 valueSummary = @"<unavailable>";
             }
         }
 
-        [ivars addObject:@{
-            @"name" : name,
-            @"typeEncoding" : typeEncoding,
-            @"value" : valueSummary ?: [NSNull null]
-        }];
+        [ivars addObject:[self rawFieldEntryWithName:name attributes:nil typeEncoding:typeEncoding value:valueSummary]];
     }
     if (ivarList) {
         free(ivarList);
     }
-
-    [ivars sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
-      return [left[@"name"] localizedCaseInsensitiveCompare:right[@"name"]];
-    }];
-    return [ivars copy];
+    return [self deduplicatedFieldEntries:ivars];
 }
 
 + (id)serializableValueSummary:(id)value {
+    return [self serializableValueSummary:value fieldName:nil wasRedacted:nil];
+}
+
++ (id)serializableValueSummary:(id)value fieldName:(NSString *)fieldName wasRedacted:(BOOL *)wasRedacted {
     if (!value) {
         return [NSNull null];
     }
-    if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSNumber class]]) {
+
+    if ([value isKindOfClass:[NSString class]]) {
+        return [self sanitizedStringValue:(NSString *)value fieldName:fieldName didRedact:wasRedacted] ?: @"";
+    }
+    if ([value isKindOfClass:[NSNumber class]]) {
         return value;
     }
     if ([value isKindOfClass:[NSURL class]]) {
-        return [(NSURL *)value absoluteString] ?: @"";
+        NSString *absoluteString = [(NSURL *)value absoluteString] ?: @"";
+        return [self sanitizedStringValue:absoluteString fieldName:fieldName didRedact:wasRedacted] ?: @"";
     }
     if ([value isKindOfClass:[NSDate class]]) {
         return @([(NSDate *)value timeIntervalSince1970]);
@@ -1117,7 +1138,7 @@ static NSString *const kDYYYDebugManifestLabel = @"Manifest";
         NSArray *array = (NSArray *)value;
         NSUInteger maxCount = MIN(array.count, 5);
         for (NSUInteger index = 0; index < maxCount; index++) {
-            [preview addObject:[self serializableValueSummary:array[index]] ?: [NSNull null]];
+            [preview addObject:[self serializableValueSummary:array[index] fieldName:nil wasRedacted:nil] ?: [NSNull null]];
         }
         return @{
             @"className" : NSStringFromClass([value class]) ?: @"NSArray",
@@ -1133,7 +1154,7 @@ static NSString *const kDYYYDebugManifestLabel = @"Manifest";
         NSUInteger maxCount = MIN(sortedKeys.count, 5);
         for (NSUInteger index = 0; index < maxCount; index++) {
             id key = sortedKeys[index];
-            preview[[key description]] = [self serializableValueSummary:[(NSDictionary *)value objectForKey:key]] ?: [NSNull null];
+            preview[[key description]] = [self serializableValueSummary:[(NSDictionary *)value objectForKey:key] fieldName:nil wasRedacted:nil] ?: [NSNull null];
         }
         return @{
             @"className" : NSStringFromClass([value class]) ?: @"NSDictionary",
@@ -1143,6 +1164,213 @@ static NSString *const kDYYYDebugManifestLabel = @"Manifest";
     }
 
     return [self richSummaryForObject:value];
+}
+
++ (NSDictionary *)rawFieldEntryWithName:(NSString *)name attributes:(NSString *)attributes typeEncoding:(NSString *)typeEncoding value:(id)value {
+    NSMutableDictionary *entry = [NSMutableDictionary dictionary];
+    entry[@"name"] = name ?: @"";
+    if (attributes.length > 0) {
+        entry[@"attributes"] = attributes;
+    }
+    if (typeEncoding.length > 0) {
+        entry[@"typeEncoding"] = typeEncoding;
+    }
+    entry[@"rawValue"] = value ?: [NSNull null];
+    entry[@"duplicateCount"] = @1;
+    return [entry copy];
+}
+
++ (NSArray<NSDictionary *> *)deduplicatedFieldEntries:(NSArray<NSDictionary *> *)entries {
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *entriesByName = [NSMutableDictionary dictionary];
+    for (NSDictionary *entry in entries) {
+        NSString *name = entry[@"name"] ?: @"";
+        if (name.length == 0) {
+            continue;
+        }
+
+        NSMutableDictionary *existingEntry = entriesByName[name];
+        if (!existingEntry) {
+            entriesByName[name] = [entry mutableCopy];
+            continue;
+        }
+
+        NSUInteger duplicateCount = [existingEntry[@"duplicateCount"] unsignedIntegerValue] + 1;
+        existingEntry[@"duplicateCount"] = @(duplicateCount);
+
+        id existingValue = existingEntry[@"rawValue"];
+        id newValue = entry[@"rawValue"];
+        BOOL existingMeaningful = [self isMeaningfulExportValue:existingValue];
+        BOOL newMeaningful = [self isMeaningfulExportValue:newValue];
+        if (!existingMeaningful && newMeaningful) {
+            existingEntry[@"rawValue"] = newValue ?: [NSNull null];
+            if (entry[@"attributes"]) {
+                existingEntry[@"attributes"] = entry[@"attributes"];
+            }
+            if (entry[@"typeEncoding"]) {
+                existingEntry[@"typeEncoding"] = entry[@"typeEncoding"];
+            }
+        }
+    }
+
+    NSArray<NSString *> *sortedNames = [[entriesByName allKeys] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    NSMutableArray<NSDictionary *> *finalEntries = [NSMutableArray array];
+    for (NSString *name in sortedNames) {
+        NSDictionary *finalEntry = [self finalizedFieldEntryFromRawEntry:entriesByName[name]];
+        if (finalEntry) {
+            [finalEntries addObject:finalEntry];
+        }
+    }
+    return [finalEntries copy];
+}
+
++ (NSDictionary *)finalizedFieldEntryFromRawEntry:(NSDictionary *)rawEntry {
+    NSString *name = rawEntry[@"name"] ?: @"";
+    if (name.length == 0) {
+        return nil;
+    }
+
+    id rawValue = rawEntry[@"rawValue"];
+    if (rawValue == [NSNull null]) {
+        rawValue = nil;
+    }
+
+    BOOL wasRedacted = NO;
+    id serializedValue = [self serializableValueSummary:rawValue fieldName:name wasRedacted:&wasRedacted] ?: [NSNull null];
+    NSMutableDictionary *entry = [NSMutableDictionary dictionary];
+    entry[@"name"] = name;
+    if ([rawEntry[@"attributes"] length] > 0) {
+        entry[@"attributes"] = rawEntry[@"attributes"];
+    }
+    if ([rawEntry[@"typeEncoding"] length] > 0) {
+        entry[@"typeEncoding"] = rawEntry[@"typeEncoding"];
+    }
+    entry[@"value"] = serializedValue ?: [NSNull null];
+
+    NSUInteger duplicateCount = [rawEntry[@"duplicateCount"] unsignedIntegerValue];
+    if (duplicateCount > 1) {
+        entry[@"duplicateCount"] = @(duplicateCount);
+    }
+    if (wasRedacted) {
+        entry[@"isRedacted"] = @YES;
+    }
+    return [entry copy];
+}
+
++ (BOOL)isMeaningfulExportValue:(id)value {
+    if (!value || value == [NSNull null]) {
+        return NO;
+    }
+    if ([value isKindOfClass:[NSString class]]) {
+        return ((NSString *)value).length > 0;
+    }
+    return YES;
+}
+
++ (BOOL)isSensitiveFieldName:(NSString *)fieldName {
+    NSString *lowerFieldName = fieldName.lowercaseString ?: @"";
+    if (lowerFieldName.length == 0) {
+        return NO;
+    }
+
+    NSArray<NSString *> *keywords = @[ @"token", @"session", @"cookie", @"passport", @"secuid", @"sec_uid" ];
+    for (NSString *keyword in keywords) {
+        if ([lowerFieldName containsString:keyword]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
++ (NSString *)sanitizedStringValue:(NSString *)string fieldName:(NSString *)fieldName didRedact:(BOOL *)didRedact {
+    NSString *sanitizedString = string ?: @"";
+    BOOL hasRedacted = NO;
+
+    if ([self isSensitiveFieldName:fieldName] && sanitizedString.length > 0) {
+        sanitizedString = [self redactedString:sanitizedString];
+        hasRedacted = YES;
+    }
+
+    BOOL hasRedactedURL = NO;
+    NSString *redactedURLString = [self redactedURLStringIfNeeded:sanitizedString didRedact:&hasRedactedURL];
+    if (hasRedactedURL) {
+        sanitizedString = redactedURLString ?: sanitizedString;
+        hasRedacted = YES;
+    }
+
+    if (didRedact) {
+        *didRedact = hasRedacted;
+    }
+    return sanitizedString;
+}
+
++ (NSString *)redactedString:(NSString *)string {
+    if (string.length <= 8) {
+        return @"***";
+    }
+
+    NSString *prefix = [string substringToIndex:MIN((NSUInteger)4, string.length)];
+    NSString *suffix = [string substringFromIndex:MAX((NSInteger)string.length - 4, 0)];
+    return [NSString stringWithFormat:@"%@***%@", prefix, suffix];
+}
+
++ (NSString *)redactedURLStringIfNeeded:(NSString *)string didRedact:(BOOL *)didRedact {
+    if (didRedact) {
+        *didRedact = NO;
+    }
+    if (string.length == 0 || [string rangeOfString:@"?"].location == NSNotFound) {
+        return string;
+    }
+
+    NSURLComponents *components = [NSURLComponents componentsWithString:string];
+    if (!components || components.queryItems.count == 0) {
+        return string;
+    }
+
+    NSMutableArray<NSURLQueryItem *> *queryItems = [NSMutableArray arrayWithCapacity:components.queryItems.count];
+    BOOL hasRedacted = NO;
+    for (NSURLQueryItem *queryItem in components.queryItems) {
+        NSString *itemName = queryItem.name ?: @"";
+        if ([self shouldRedactURLQueryItem:itemName]) {
+            NSString *maskedValue = queryItem.value.length > 0 ? [self redactedString:queryItem.value] : @"***";
+            [queryItems addObject:[NSURLQueryItem queryItemWithName:itemName value:maskedValue]];
+            hasRedacted = YES;
+        } else {
+            [queryItems addObject:queryItem];
+        }
+    }
+
+    if (!hasRedacted) {
+        return string;
+    }
+
+    components.queryItems = queryItems;
+    if (didRedact) {
+        *didRedact = YES;
+    }
+    return components.string ?: string;
+}
+
++ (BOOL)shouldRedactURLQueryItem:(NSString *)itemName {
+    NSString *lowerItemName = itemName.lowercaseString ?: @"";
+    if (lowerItemName.length == 0) {
+        return NO;
+    }
+
+    NSSet<NSString *> *exactNames = [NSSet setWithArray:@[
+        @"device_id", @"iid", @"did", @"sec_did", @"cdid", @"idfv", @"openudid",
+        @"share_sign", @"auth", @"auth_token", @"sessionid", @"passport_csrf_token"
+    ]];
+    if ([exactNames containsObject:lowerItemName]) {
+        return YES;
+    }
+
+    NSArray<NSString *> *keywords = @[ @"token", @"sessionid", @"cookie", @"passport" ];
+    for (NSString *keyword in keywords) {
+        if ([lowerItemName containsString:keyword]) {
+            return YES;
+        }
+    }
+    return NO;
 }
 
 + (NSString *)textRepresentationForModelFieldSnapshot:(NSDictionary *)snapshot {
@@ -1179,13 +1407,31 @@ static NSString *const kDYYYDebugManifestLabel = @"Manifest";
         }
         [text appendString:@"  properties:\n"];
         for (NSDictionary *property in segment[@"properties"]) {
-            [text appendFormat:@"    - %@ = %@\n", property[@"name"] ?: @"", [self safeStringDescriptionForObject:property[@"value"]]];
+            NSMutableString *suffix = [NSMutableString string];
+            if ([property[@"duplicateCount"] integerValue] > 1) {
+                [suffix appendFormat:@" [去重x%@]", property[@"duplicateCount"]];
+            }
+            if ([property[@"isRedacted"] boolValue]) {
+                [suffix appendString:@" [已脱敏]"];
+            }
+            [text appendFormat:@"    - %@%@ = %@\n",
+                               property[@"name"] ?: @"",
+                               suffix,
+                               [self safeStringDescriptionForObject:property[@"value"]]];
         }
         [text appendString:@"  ivars:\n"];
         for (NSDictionary *ivar in segment[@"ivars"]) {
-            [text appendFormat:@"    - %@ (%@) = %@\n",
+            NSMutableString *suffix = [NSMutableString string];
+            if ([ivar[@"duplicateCount"] integerValue] > 1) {
+                [suffix appendFormat:@" [去重x%@]", ivar[@"duplicateCount"]];
+            }
+            if ([ivar[@"isRedacted"] boolValue]) {
+                [suffix appendString:@" [已脱敏]"];
+            }
+            [text appendFormat:@"    - %@ (%@)%@ = %@\n",
                                ivar[@"name"] ?: @"",
                                ivar[@"typeEncoding"] ?: @"",
+                               suffix,
                                [self safeStringDescriptionForObject:ivar[@"value"]]];
         }
     }

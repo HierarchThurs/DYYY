@@ -7829,7 +7829,7 @@ static void DYYYRemoveKeyboardObserver(void) {
     initTargetClassNames();
 
     updateGlobalTransparencyCache();
-    [[DYYYDebugOverlayManager sharedManager] setDebugModeEnabled:[[NSUserDefaults standardUserDefaults] boolForKey:@"DYYYEnableDebugMode"]];
+    [[DYYYDebugOverlayManager sharedManager] bootstrapFromStoredSettings];
 
     [[NSUserDefaults standardUserDefaults] addObserver:(NSObject *)self forKeyPath:kDYYYGlobalTransparencyKey options:NSKeyValueObservingOptionNew context:DYYYGlobalTransparencyContext];
 
